@@ -19,6 +19,7 @@ import { AnalysisResult } from './components/features/analysis/AnalysisResult'
 import { EmailModal } from './components/features/shared/EmailModal'
 import { EmailReaderModal } from './components/features/shared/EmailReaderModal'
 import { parseInvoiceLocal } from "./lib/localInvoiceApi";
+import { ExactOnlinePanel } from "./components/features/exact/ExactOnlinePanel";
 
 import { Button } from "@/components/ui/button"
 
@@ -512,7 +513,9 @@ function App() {
             onRetry={() => { setLocalInvoiceError(null); setLocalInvoiceStatus('idle'); }}
           />
 
-
+          {localInvoiceStatus === 'complete' && localInvoiceResult && (
+            <ExactOnlinePanel invoiceResult={localInvoiceResult} />
+          )}
 
           <Button
             className="w-full p-6 text-base font-semibold bg-linear-to-br from-indigo-500 to-violet-500 hover:shadow-lg hover:shadow-indigo-500/20 transition-all"

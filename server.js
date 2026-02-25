@@ -13,7 +13,7 @@ import multer from "multer";
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-app.use(cors({origin: "http://localhost:5173"}));
+app.use(cors({ origin: "http://localhost:5173" }));
 app.use(express.json());
 
 const execFileAsync = promisify(execFile);
@@ -159,7 +159,7 @@ app.post("/api/invoice/parse", upload.single("file"), async (req, res) => {
     try {
       fs.unlinkSync(absUploaded);
       fs.unlinkSync(txtPath);
-    } catch {}
+    } catch { }
 
     return res.json({ ok: true, result: invoiceJson });
   } catch (e) {
@@ -336,6 +336,211 @@ app.get("/api/emails", async (req, res) => {
     console.error("[DEBUG:IMAP] Error occurred:", err.message);
     console.error("[DEBUG:IMAP] Full error:", err);
     res.status(500).json({ error: "Failed to fetch emails: " + err.message });
+  }
+});
+
+// ─── Exact Online OAuth + API ───────────────────────────────────────────────
+
+const EXACT_BASE = process.env.EXACT_BASE_URL || "https://start.exactonline.nl";
+const EXACT_CLIENT_ID = process.env.EXACT_CLIENT_ID || "";
+const EXACT_CLIENT_SECRET = process.env.EXACT_CLIENT_SECRET || "";
+const EXACT_REDIRECT_URI = process.env.EXACT_REDIRECT_URI || "";
+
+// In-memory token store (lost on restart)
+const exactTokens = {
+  access_token: null,
+  refresh_token: null,
+  expires_at: 0,
+  division: null,
+};
+
+async function refreshExactToken() {
+  if (!exactTokens.refresh_token) throw new Error("No refresh token available");
+
+  const params = new URLSearchParams({
+    grant_type: "refresh_token",
+    refresh_token: exactTokens.refresh_token,
+    client_id: EXACT_CLIENT_ID,
+    client_secret: EXACT_CLIENT_SECRET,
+  });
+
+  const r = await fetch(`${EXACT_BASE}/api/oauth2/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: params.toString(),
+  });
+
+  if (!r.ok) {
+    const txt = await r.text();
+    throw new Error(`Token refresh failed: ${r.status} ${txt}`);
+  }
+
+  const data = await r.json();
+  exactTokens.access_token = data.access_token;
+  exactTokens.refresh_token = data.refresh_token; // Exact rotates refresh tokens
+  exactTokens.expires_at = Date.now() + (data.expires_in || 600) * 1000 - 30000;
+  console.log("[EXACT] Token refreshed successfully");
+}
+
+async function getExactAccessToken() {
+  if (!exactTokens.access_token) throw new Error("Not connected to Exact Online");
+  if (Date.now() >= exactTokens.expires_at) {
+    await refreshExactToken();
+  }
+  return exactTokens.access_token;
+}
+
+async function fetchExactDivision(accessToken) {
+  const r = await fetch(`${EXACT_BASE}/api/v1/current/Me?$select=CurrentDivision`, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: "application/json",
+    },
+  });
+  if (!r.ok) throw new Error(`Failed to fetch division: ${r.status}`);
+  const data = await r.json();
+  return data?.d?.results?.[0]?.CurrentDivision ?? null;
+}
+
+// 1) Redirect to Exact OAuth authorize
+app.get("/auth/exact", (req, res) => {
+  if (!EXACT_CLIENT_ID || !EXACT_REDIRECT_URI) {
+    return res.status(500).json({ error: "EXACT_CLIENT_ID or EXACT_REDIRECT_URI not configured" });
+  }
+
+  const params = new URLSearchParams({
+    client_id: EXACT_CLIENT_ID,
+    redirect_uri: EXACT_REDIRECT_URI,
+    response_type: "code",
+    force_login: "0",
+  });
+
+  res.redirect(`${EXACT_BASE}/api/oauth2/auth?${params.toString()}`);
+});
+
+// 2) OAuth callback — exchange code for tokens
+app.get("/auth/exact/callback", async (req, res) => {
+  const { code } = req.query;
+  if (!code) return res.status(400).send("Missing authorization code");
+
+  try {
+    const params = new URLSearchParams({
+      grant_type: "authorization_code",
+      code,
+      redirect_uri: EXACT_REDIRECT_URI,
+      client_id: EXACT_CLIENT_ID,
+      client_secret: EXACT_CLIENT_SECRET,
+    });
+
+    const tokenRes = await fetch(`${EXACT_BASE}/api/oauth2/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: params.toString(),
+    });
+
+    if (!tokenRes.ok) {
+      const txt = await tokenRes.text();
+      return res.status(502).send(`Token exchange failed: ${tokenRes.status} ${txt}`);
+    }
+
+    const data = await tokenRes.json();
+    exactTokens.access_token = data.access_token;
+    exactTokens.refresh_token = data.refresh_token;
+    exactTokens.expires_at = Date.now() + (data.expires_in || 600) * 1000 - 30000;
+
+    // Fetch division
+    exactTokens.division = await fetchExactDivision(data.access_token);
+    console.log("[EXACT] Connected! Division:", exactTokens.division);
+
+    // Redirect back to the React app
+    res.send(`
+      <html><body style="font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;background:#0f172a;color:#e2e8f0">
+        <div style="text-align:center">
+          <h1 style="color:#10b981">✅ Connected to Exact Online</h1>
+          <p>Division: ${exactTokens.division}</p>
+          <p>You can close this tab and return to the app.</p>
+        </div>
+      </body></html>
+    `);
+  } catch (err) {
+    console.error("[EXACT] Callback error:", err);
+    res.status(500).send(`OAuth error: ${err.message}`);
+  }
+});
+
+// 3) Check connection status
+app.get("/api/exact/status", (req, res) => {
+  res.json({
+    connected: !!exactTokens.access_token,
+    division: exactTokens.division,
+  });
+});
+
+// 4) Push invoice to Exact Online as a Purchase Entry
+app.post("/api/exact/push-invoice", async (req, res) => {
+  try {
+    const accessToken = await getExactAccessToken();
+    const division = exactTokens.division;
+    if (!division) return res.status(400).json({ error: "No Exact division found. Re-connect." });
+
+    const { invoiceData, supplierGuid, glAccountGuid, journal } = req.body;
+    if (!invoiceData) return res.status(400).json({ error: "invoiceData is required" });
+    if (!supplierGuid) return res.status(400).json({ error: "supplierGuid is required" });
+    if (!glAccountGuid) return res.status(400).json({ error: "glAccountGuid is required" });
+
+    // Map analyzed JSON → Exact PurchaseEntries
+    const items = invoiceData.items || [];
+    const purchaseEntryLines = items.map((item) => ({
+      AmountFC: item.amount ?? 0,
+      Description: item.description ?? "",
+      GLAccount: glAccountGuid,
+    }));
+
+    // If no line items but we have totals, create a single line
+    if (purchaseEntryLines.length === 0 && invoiceData.totals?.total) {
+      purchaseEntryLines.push({
+        AmountFC: invoiceData.totals.total,
+        Description: "Invoice total",
+        GLAccount: glAccountGuid,
+      });
+    }
+
+    const payload = {
+      Journal: journal || "70", // default purchase journal code
+      Supplier: supplierGuid,
+      InvoiceNumber: invoiceData.invoice_number || undefined,
+      InvoiceDate: invoiceData.invoice_date ? `${invoiceData.invoice_date}T00:00:00` : undefined,
+      DueDate: invoiceData.due_date ? `${invoiceData.due_date}T00:00:00` : undefined,
+      PurchaseEntryLines: purchaseEntryLines,
+    };
+
+    console.log("[EXACT] Posting PurchaseEntry:", JSON.stringify(payload, null, 2));
+
+    const r = await fetch(
+      `${EXACT_BASE}/api/v1/${division}/purchaseentry/PurchaseEntries`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify(payload),
+      }
+    );
+
+    const body = await r.text();
+    if (!r.ok) {
+      console.error("[EXACT] PurchaseEntry POST failed:", r.status, body);
+      return res.status(r.status).json({ error: "Exact API error", status: r.status, body });
+    }
+
+    const result = JSON.parse(body);
+    console.log("[EXACT] PurchaseEntry created successfully");
+    res.json({ ok: true, result: result?.d });
+  } catch (err) {
+    console.error("[EXACT] Push error:", err);
+    res.status(500).json({ error: err.message });
   }
 });
 
